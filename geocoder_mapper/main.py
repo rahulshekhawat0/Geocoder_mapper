@@ -1,9 +1,12 @@
+# geocoder_mapper/main.py
+import os
 import io
 import math
 import time
 import csv
 import unicodedata
 from typing import Optional, Tuple, Dict, List
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -11,30 +14,21 @@ from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
 # =========================
-# Page setup
+# Config / constants
 # =========================
-st.set_page_config(page_title="Free Geocoder + DB Mapper", page_icon="🗺️", layout="wide")
-st.title("🗺️ Free Location Geocoder + DB Mapper")
-st.write(
-    "Upload **raw locations** (text) and your **DB locations**. "
-    "We geocode raw text (free via OpenStreetMap Nominatim) and map to the nearest DB location. "
-    "Special handling: Indian State/UT labels and foreign countries."
-)
-
-# =========================
-# Constants
-# =========================
+APP_DIR = os.path.dirname(__file__) if "__file__" in globals() else "."
+CACHE_PATH = os.path.join(APP_DIR, ".geocode_cache.csv")  # Option A: inside app folder
 INDIA_CC = "in"
 RATE_DELAY_SEC = 1.05  # be polite to Nominatim
 
 INDIAN_STATES_UTS = {
-    # States
+    # states
     "andhra pradesh","arunachal pradesh","assam","bihar","chhattisgarh","goa",
     "gujarat","haryana","himachal pradesh","jharkhand","karnataka","kerala",
     "madhya pradesh","maharashtra","manipur","meghalaya","mizoram","nagaland",
     "odisha","punjab","rajasthan","sikkim","tamil nadu","telangana","tripura",
     "uttar pradesh","uttarakhand","west bengal",
-    # UTs
+    # uts
     "andaman and nicobar islands","chandigarh","dadra and nagar haveli and daman and diu",
     "lakshadweep","delhi","puducherry","jammu and kashmir","ladakh"
 }
@@ -61,9 +55,8 @@ def haversine(lat1, lon1, lat2, lon2):
          math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2)
     return 2 * R * math.asin(math.sqrt(a))
 
+# Robust CSV reading
 def _pandas_read_csv_from_text(text: str, expected_min_cols=1) -> pd.DataFrame:
-    """Very robust CSV parsing with multiple delimiter fallbacks."""
-    # 1) Try Sniffer
     sep = None
     try:
         sample = text[:5000]
@@ -73,7 +66,6 @@ def _pandas_read_csv_from_text(text: str, expected_min_cols=1) -> pd.DataFrame:
     except Exception:
         sep = None
 
-    # 2) Try pandas inference first
     try:
         df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", on_bad_lines="skip")
         if df.shape[1] >= expected_min_cols:
@@ -81,7 +73,6 @@ def _pandas_read_csv_from_text(text: str, expected_min_cols=1) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 3) Try common delimiters manually
     for candidate in [",", ";", "\t", "|"]:
         try:
             df = pd.read_csv(io.StringIO(text), sep=candidate, engine="python", on_bad_lines="skip")
@@ -90,7 +81,6 @@ def _pandas_read_csv_from_text(text: str, expected_min_cols=1) -> pd.DataFrame:
         except Exception:
             continue
 
-    # 4) Last resort: whitespace
     df = pd.read_csv(io.StringIO(text), delim_whitespace=True, engine="python", on_bad_lines="skip")
     if df.shape[1] < expected_min_cols:
         raise ValueError(f"Only {df.shape[1]} columns detected, need ≥ {expected_min_cols}.")
@@ -111,44 +101,70 @@ def robust_read_upload(upload, expected_min_cols=1) -> pd.DataFrame:
     raise ValueError(f"Couldn't read CSV with tried encodings {encodings}. Last error: {last_err}")
 
 # =========================
-# Sidebar
+# Streamlit UI
 # =========================
+st.set_page_config(page_title="Free Geocoder + DB Mapper", page_icon="🗺️", layout="wide")
+st.title("🗺️ Free Location Geocoder + DB Mapper")
+st.write(
+    "Upload **raw locations** (text) and your **DB locations** (names or with lat/lon). "
+    "We geocode raw text via OpenStreetMap Nominatim, map to nearest DB location, and cache results."
+)
+
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-
     country_bias = st.text_input("Country code bias (2 letters)", value=INDIA_CC)
     user_agent = st.text_input("User-Agent (required by Nominatim)", value="rahul-geocoder-mapper/1.0 (educational)")
-
-    max_rows = st.number_input("Limit rows (for testing)", min_value=0, value=0, step=1, help="0 = no limit")
+    max_rows = st.number_input("Limit rows (for testing)", min_value=0, value=0, step=1,
+                               help="0 = no limit")
     cutoff_km = st.number_input("Cutoff distance (km) to accept nearest DB match", min_value=0.0, value=0.0, step=1.0,
                                 help="0 = always accept nearest. If >0, farther rows become 'No reliable match'.")
-
     prefer_full_string = st.checkbox("Prefer full location string (do NOT trim after commas)", value=False)
     strict_country = st.checkbox("Strict country match (must match bias)", value=False)
-
     allow_db_geocode = st.checkbox("If DB lacks lat/lon, geocode DB names (slower)", value=True)
     show_debug = st.checkbox("Show debug panel", value=False)
-
+    use_cache = st.checkbox("Use local cache file (fast)", value=True)
     run_button = st.button("Run Mapping")
 
-# Debug store
+# Debug/log storage
 if "debug_logs" not in st.session_state:
-    st.session_state.debug_logs = []  # list of strings
-
+    st.session_state.debug_logs = []
 def log(msg: str):
     if show_debug:
         st.session_state.debug_logs.append(msg)
+
+# =========================
+# Cache handling (Option A)
+# =========================
+def load_cache(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["q","lat","lon","display_name","country","country_code","when"])
+    try:
+        df = pd.read_csv(path, dtype=str)
+        # ensure columns
+        for c in ["q","lat","lon","display_name","country","country_code","when"]:
+            if c not in df.columns:
+                df[c] = None
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["q","lat","lon","display_name","country","country_code","when"])
+
+def save_cache(df: pd.DataFrame, path: str):
+    try:
+        df.to_csv(path, index=False, encoding="utf-8")
+    except Exception as e:
+        st.warning(f"Failed to save cache: {e}")
+
+cache_df = load_cache(CACHE_PATH) if os.path.exists(CACHE_PATH) else load_cache(CACHE_PATH)
 
 # =========================
 # File uploads
 # =========================
 left, right = st.columns(2)
 with left:
-    raw_file = st.file_uploader("Upload RAW locations CSV", type=["csv"],
-                                help="Needs one column that has the free-text locations.")
+    raw_file = st.file_uploader("Upload RAW locations CSV", type=["csv"], help="Needs one column containing raw location text.")
 with right:
-    db_file = st.file_uploader("Upload DB locations CSV", type=["csv"],
-                               help="Preferred columns: db_location, lat, lon (if lat/lon missing we can geocode names).")
+    db_file = st.file_uploader("Upload DB locations CSV", type=["csv"], help="Preferred columns: db_location, lat, lon (lat/lon optional).")
 
 raw_col = None
 db_name_col = None
@@ -171,13 +187,10 @@ if db_file is not None:
         db_df = robust_read_upload(db_file, expected_min_cols=1)
         st.success(f"DB loaded: {db_df.shape[0]} rows, {db_df.shape[1]} cols")
         guess_name = "db_location" if "db_location" in db_df.columns else db_df.columns[0]
-        db_name_col = st.selectbox("Select DB location name column", db_df.columns.tolist(),
-                                   index=db_df.columns.get_loc(guess_name))
-        db_lat_col = st.selectbox("Select DB latitude column (or 'None' if absent)",
-                                  ["None"] + db_df.columns.tolist(),
+        db_name_col = st.selectbox("Select DB location name column", db_df.columns.tolist(), index=db_df.columns.get_loc(guess_name))
+        db_lat_col = st.selectbox("Select DB latitude column (or 'None' if absent)", ["None"] + db_df.columns.tolist(),
                                   index=(db_df.columns.get_loc("lat")+1) if "lat" in db_df.columns else 0)
-        db_lon_col = st.selectbox("Select DB longitude column (or 'None' if absent)",
-                                  ["None"] + db_df.columns.tolist(),
+        db_lon_col = st.selectbox("Select DB longitude column (or 'None' if absent)", ["None"] + db_df.columns.tolist(),
                                   index=(db_df.columns.get_loc("lon")+1) if "lon" in db_df.columns else 0)
     except Exception as e:
         st.error(f"Couldn't read DB CSV: {e}")
@@ -197,31 +210,28 @@ def get_geocoder(ua: str):
 geolocator = None
 geocode = None
 if user_agent.strip():
-    geolocator, geocode = get_geocoder(user_agent.strip())
+    try:
+        geolocator, geocode = get_geocoder(user_agent.strip())
+    except Exception as e:
+        st.error(f"Failed to initialize geocoder: {e}")
 
+# Candidate generation
 def build_candidates(q: str, cc_bias: Optional[str]) -> List[str]:
-    """Generate smart candidates from a raw string."""
     q = normalize_txt(q)
     if not q:
         return []
-
     parts = [p.strip() for p in q.split(",") if p.strip()]
     cand = []
-
-    # Prefer full string or trimmed first token
     if prefer_full_string or len(parts) == 1:
         cand.append(q)
     else:
-        cand.append(parts[0])                  # e.g., 'Sohagpur'
-        cand.append(q)                         # full 'Sohagpur, MP, India'
-
-    # Add country-biased variants
+        cand.append(parts[0])
+        cand.append(q)
     if (cc_bias or "").lower() == "in":
         for base in list(cand):
             if not base.lower().endswith("india"):
                 cand.append(f"{base}, India")
-
-    # Dedupe, keep order
+    # keep unique order
     seen, uniq = set(), []
     for x in cand:
         if x not in seen:
@@ -230,15 +240,82 @@ def build_candidates(q: str, cc_bias: Optional[str]) -> List[str]:
     log(f"Candidates for '{q}': {uniq}")
     return uniq
 
+# Check cache first
+def lookup_cache(q: str) -> Optional[Dict]:
+    if not use_cache:
+        return None
+    qn = normalize_txt(q)
+    if cache_df.empty:
+        return None
+    found = cache_df[cache_df["q"] == qn]
+    if not found.empty:
+        r = found.iloc[-1]  # most recent
+        try:
+            return {
+                "lat": float(r["lat"]),
+                "lon": float(r["lon"]),
+                "display_name": r.get("display_name", None),
+                "country": r.get("country", None),
+                "country_code": r.get("country_code", None),
+            }
+        except Exception:
+            return None
+    return None
+
+# Save a single cache entry (append)
+def append_cache_entry(q: str, lat: float, lon: float, display_name: str, country: Optional[str], country_code: Optional[str]):
+    global cache_df
+    qn = normalize_txt(q)
+    row = {"q": qn, "lat": lat, "lon": lon, "display_name": display_name, "country": country, "country_code": country_code, "when": datetime.utcnow().isoformat()}
+    try:
+        if cache_df is None or cache_df.empty:
+            cache_df = pd.DataFrame([row])
+        else:
+            cache_df = pd.concat([cache_df, pd.DataFrame([row])], ignore_index=True, axis=0)
+        save_cache(cache_df, CACHE_PATH)
+    except Exception as e:
+        log(f"Failed to append cache: {e}")
+
+# Geocode with candidate tries; use cache if available
 def geocode_text(q: str, cc_bias: Optional[str]) -> Optional[Tuple[float, float, Dict]]:
     if not geocode or not q or not q.strip():
         return None
+
+    # cache lookup
+    cached = lookup_cache(q)
+    if cached:
+        log(f"♻️ Cache hit: '{normalize_txt(q)}' -> {cached['lat']},{cached['lon']}")
+        return float(cached["lat"]), float(cached["lon"]), {"display_name": cached.get("display_name"), "address": {"country": cached.get("country")}, "country_code": cached.get("country_code")}
+
     for cand in build_candidates(q, cc_bias):
-        loc = geocode(cand, addressdetails=True, country_codes=cc_bias, exactly_one=True)
+        try:
+            loc = geocode(cand, addressdetails=True, country_codes=cc_bias, exactly_one=True)
+        except Exception:
+            # swallow & continue (RateLimiter may handle delays)
+            loc = None
+
+        # If exactly_one=True returns None, try exactly_one=False and take first (sometimes works)
+        if not loc:
+            try:
+                locs = geolocator.geocode(cand, addressdetails=True, country_codes=cc_bias, exactly_one=False)
+                if locs and isinstance(locs, list) and len(locs) > 0:
+                    loc = locs[0]
+            except Exception:
+                loc = None
+
         if loc:
             lat, lon = float(loc.latitude), float(loc.longitude)
             raw = loc.raw or {}
-            log(f"✅ Hit: '{cand}' -> {lat},{lon} ({raw.get('display_name','')[:80]}...)")
+            addr = raw.get("address", {}) if isinstance(raw, dict) else {}
+            display_name = raw.get("display_name", "") if isinstance(raw, dict) else ""
+            country_name = addr.get("country")
+            country_code = addr.get("country_code")
+            log(f"✅ Hit: '{cand}' -> {lat},{lon} ({display_name[:80]}...)")
+            # append to cache
+            try:
+                append_cache_entry(cand, lat, lon, display_name, country_name, country_code)
+            except Exception as e:
+                log(f"Cache append failed: {e}")
             return lat, lon, raw
         else:
             log(f"❌ Miss: '{cand}'")
@@ -277,6 +354,7 @@ def ensure_db_latlon(df: pd.DataFrame, name_col: str, lat_col_opt: Optional[str]
         if g:
             rows.append({"db_location": nm, "__lat": g[0], "__lon": g[1]})
         prog.progress(i/len(uniq), text=f"Geocoding DB locations… ({i}/{len(uniq)})")
+        time.sleep(0.01)
     prog.empty()
     if not rows:
         raise ValueError("Could not geocode any DB locations.")
@@ -298,13 +376,11 @@ def map_one(raw_txt: str, db_tbl: pd.DataFrame, cutoff: float, cc_bias: Optional
     }
     raw_txt_norm = normalize_txt(raw_txt)
 
-    # Rule 1: If direct Indian State/UT string
     if is_indian_state_or_ut(raw_txt_norm):
         result["mapped_to"] = raw_txt_norm
         result["label"] = "indian_state"
         return result
 
-    # Geocode raw
     g = geocode_text(raw_txt_norm, cc_bias)
     if not g:
         result["label"] = "not_geocoded"
@@ -315,19 +391,16 @@ def map_one(raw_txt: str, db_tbl: pd.DataFrame, cutoff: float, cc_bias: Optional
     country_name, country_code = extract_country_info(raw)
     result["country"], result["country_code"] = country_name, country_code
 
-    # Strict country check
     if strict_country and country_code and cc_bias and country_code.lower() != cc_bias.lower():
         result["mapped_to"] = country_name or raw_txt_norm
         result["label"] = "foreign_country" if country_code.lower() != INDIA_CC else "no_reliable_match"
         return result
 
-    # If outside India
     if country_code and country_code.lower() != INDIA_CC:
         result["mapped_to"] = country_name or raw_txt_norm
         result["label"] = "foreign_country"
         return result
 
-    # Nearest DB
     if db_tbl.empty:
         result["label"] = "no_reliable_match"
         return result
@@ -351,7 +424,8 @@ def map_one(raw_txt: str, db_tbl: pd.DataFrame, cutoff: float, cc_bias: Optional
 # Run
 # =========================
 if run_button:
-    st.session_state.debug_logs = []  # reset each run if debug is on
+    # reset debug logs
+    st.session_state.debug_logs = []
     if raw_df is None or db_df is None:
         st.error("Please upload both RAW and DB CSVs.")
         st.stop()
@@ -398,17 +472,14 @@ if run_button:
         st.dataframe(out_df.head(50), use_container_width=True)
 
         csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download results CSV", data=csv_bytes,
-                           file_name="mapped_output.csv", mime="text/csv")
+        st.download_button("⬇️ Download results CSV", data=csv_bytes, file_name="mapped_output.csv", mime="text/csv")
 
         st.success("Done!")
         st.info("Labels: nearest_db, indian_state, foreign_country, no_reliable_match, not_geocoded")
     except Exception as e:
         st.error(f"Processing failed: {e}")
 
-# =========================
 # Debug panel
-# =========================
 if show_debug and st.session_state.debug_logs:
     with st.expander("🔎 Debug panel (geocoding attempts)"):
         for line in st.session_state.debug_logs:
